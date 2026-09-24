@@ -26,6 +26,7 @@ import {
   ArrowRightBold,
   Bottom,
   Close,
+  Scissor,
 } from '@element-plus/icons-vue';
 import { parseFsbBank, detectFsbBank, type FsbSampleMeta } from '@/utils/fsbParser';
 import { decodeFsbSubSound } from '@/utils/fsbDecode';
@@ -251,6 +252,13 @@ const fsbOffset = ref(0);
 const bankMode = ref(0);
 const samples = ref<FsbSampleMeta[]>([]);
 const replaced = reactive<Record<number, ReplacedEntry>>({});
+
+// 裁剪设置：{ [sampleIndex]: { startSec: number, endSec: number } }
+const trimSettings = reactive<Record<number, { startSec: number; endSec: number }>>({});
+const trimDialog = ref(false);
+const trimIndex = ref(-1);
+const trimForm = reactive({ startSec: 0, endSec: 0 });
+const trimOriginalDuration = ref(0);
 
 const urls = reactive<Record<number, string>>({});
 const loading = reactive<Record<number, boolean>>({});
@@ -773,6 +781,67 @@ const undoReplace = async (i: number) => {
   ElMessage.info(`已还原「${samples.value[i].name}」`);
 };
 
+// ---------------------------------------------------------------- 裁剪功能
+
+const isTrimmed = (i: number) => trimSettings[i] !== undefined;
+
+const openTrimDialog = (i: number) => {
+  const s = samples.value[i];
+  if (!s) return;
+  trimIndex.value = i;
+  trimOriginalDuration.value = s.duration;
+  // 如果已有裁剪设置，加载它们；否则默认全范围
+  const existing = trimSettings[i];
+  trimForm.startSec = existing?.startSec ?? 0;
+  trimForm.endSec = existing?.endSec ?? s.duration;
+  trimDialog.value = true;
+};
+
+const applyTrim = () => {
+  const i = trimIndex.value;
+  if (i < 0) return;
+  const s = samples.value[i];
+  if (!s) return;
+  
+  // 验证输入
+  if (trimForm.startSec < 0 || trimForm.endSec <= trimForm.startSec || trimForm.endSec > s.duration) {
+    ElMessage.warning('裁剪范围无效：起始必须 ≥ 0，结束必须 > 起始且 ≤ 原时长');
+    return;
+  }
+  
+  // 如果范围等于全长，清除裁剪
+  if (trimForm.startSec === 0 && Math.abs(trimForm.endSec - s.duration) < 0.01) {
+    delete trimSettings[i];
+    ElMessage.info('已清除裁剪（保留全长）');
+  } else {
+    trimSettings[i] = { startSec: trimForm.startSec, endSec: trimForm.endSec };
+    ElMessage.success(`已设置裁剪：${trimForm.startSec.toFixed(2)}s → ${trimForm.endSec.toFixed(2)}s`);
+  }
+  trimDialog.value = false;
+};
+
+const clearTrim = (i: number) => {
+  delete trimSettings[i];
+  ElMessage.info(`已清除「${samples.value[i].name}」的裁剪`);
+};
+
+/** 裁剪 PCM16 数据 */
+const trimPcm16 = (
+  pcm: Int16Array,
+  channels: number,
+  sampleRate: number,
+  startSec: number,
+  endSec: number,
+): Int16Array => {
+  const startFrame = Math.floor(startSec * sampleRate);
+  const endFrame = Math.min(Math.floor(endSec * sampleRate), Math.floor(pcm.length / channels));
+  const frameCount = endFrame - startFrame;
+  if (frameCount <= 0) return new Int16Array(0);
+  const startIdx = startFrame * channels;
+  const endIdx = endFrame * channels;
+  return pcm.slice(startIdx, endIdx);
+};
+
 const onRowDragOver = (i: number, e: DragEvent) => {
   e.preventDefault();
   dragOverIndex.value = i;
@@ -1111,6 +1180,19 @@ const exportAll = async () => {
 
 const onExport = async () => {
   if (!fsbBytes.value || samples.value.length === 0) return;
+  
+  // 检查：增量模式下不能裁剪未替换的样本（字节原样保留）
+  if (exportMethod.value === 'incremental') {
+    const trimmedNonReplaced = Object.keys(trimSettings)
+      .map(Number)
+      .filter((i) => !replaced[i]);
+    if (trimmedNonReplaced.length > 0) {
+      const names = trimmedNonReplaced.map((i) => samples.value[i].name).join('、');
+      ElMessage.warning(`增量模式无法裁剪未替换的样本（${names}）。请切换到「PCM16 全量」模式，或先替换这些样本。`);
+      return;
+    }
+  }
+  
   exporting.value = true;
   exportStatus.value = '';
   exportProgress.value = 0;
@@ -1121,12 +1203,23 @@ const onExport = async () => {
     // 被替换样本的新旧帧数：写回容器时用于同步前缀里的时长标记
     let rawPairs: { index: number; oldFrames: number; newFrames: number }[] = [];
 
+    // 辅助函数：应用裁剪（如果有）
+    const applyTrimIfNeeded = (i: number, pcm: Int16Array, channels: number, sampleRate: number): Int16Array => {
+      const trim = trimSettings[i];
+      if (!trim) return pcm;
+      return trimPcm16(pcm, channels, sampleRate, trim.startSec, trim.endSec);
+    };
+
     if (exportMethod.value === 'incremental') {
       exportStatus.value = '正在重打包（未替换样本字节原样保留）…';
       exportProgress.value = 20;
-      const replacements = new Map(
-        Object.entries(replaced).map(([k, v]) => [Number(k), v]),
-      );
+      // 构建替换映射，应用裁剪
+      const replacements = new Map<number, ReplacedEntry>();
+      for (const [k, v] of Object.entries(replaced)) {
+        const i = Number(k);
+        const trimmedPcm = applyTrimIfNeeded(i, v.pcm, v.channels, v.sampleRate);
+        replacements.set(i, { ...v, pcm: trimmedPcm });
+      }
       const { fsb: out, report } = await repackFsb5Incremental(fsb, replacements);
       newFsb = out;
       // 采样率变了的替换样本不参与时长标记同步（标记单位是帧数，换率后无法可靠换算）
@@ -1139,34 +1232,48 @@ const onExport = async () => {
       exportProgress.value = 95;
       const conv = Object.keys(report.convertedByIndex).length;
       const dropped = Object.keys(report.droppedLoopByIndex).length;
+      const trimmed = Object.keys(trimSettings).length;
       exportStatus.value = `增量完成：${report.originalSize}B → ${report.newSize}B（${conv} 条格式转换${
         dropped ? `，${dropped} 条丢弃失效 loop` : ''
-      }）`;
+      }${trimmed ? `，${trimmed} 条已裁剪` : ''}）`;
     } else {
       exportStatus.value = '正在把全部样本转成 PCM16…';
       const ws: FsbWriteSample[] = [];
       for (let i = 0; i < samples.value.length; i++) {
         const rep = replaced[i];
         if (rep) {
-          ws.push({ name: samples.value[i].name, pcm: rep.pcm, channels: rep.channels, sampleRate: rep.sampleRate });
+          // 应用裁剪
+          const trimmedPcm = applyTrimIfNeeded(i, rep.pcm, rep.channels, rep.sampleRate);
+          ws.push({ name: samples.value[i].name, pcm: trimmedPcm, channels: rep.channels, sampleRate: rep.sampleRate });
           // 与 writeFsb5 的 frameCount 算法一致；采样率变了的样本不参与时长标记同步
           if (rep.sampleRate === samples.value[i].frequency) {
             rawPairs.push({
               index: i,
               oldFrames: samples.value[i].sampleCount,
-              newFrames: Math.floor(rep.pcm.length / rep.channels),
+              newFrames: Math.floor(trimmedPcm.length / rep.channels),
             });
           }
         } else {
           const { pcm, channels, sampleRate } = await sampleToPcm16(i);
-          ws.push({ name: samples.value[i].name, pcm, channels, sampleRate });
+          // 应用裁剪
+          const trimmedPcm = applyTrimIfNeeded(i, pcm, channels, sampleRate);
+          ws.push({ name: samples.value[i].name, pcm: trimmedPcm, channels, sampleRate });
+          // 非替换样本如果裁剪了，也需要同步时长标记
+          if (trimSettings[i] && sampleRate === samples.value[i].frequency) {
+            rawPairs.push({
+              index: i,
+              oldFrames: samples.value[i].sampleCount,
+              newFrames: Math.floor(trimmedPcm.length / channels),
+            });
+          }
         }
         exportProgress.value = Math.round(((i + 1) / samples.value.length) * 70);
         exportStatus.value = `正在转 PCM16… ${i + 1}/${samples.value.length}`;
       }
       newFsb = writeFsb5(ws, FSB5_MODE_PCM16);
       exportProgress.value = 95;
-      exportStatus.value = `PCM16 全量完成：${fsb.length}B → ${newFsb.length}B`;
+      const trimmed = Object.keys(trimSettings).length;
+      exportStatus.value = `PCM16 全量完成：${fsb.length}B → ${newFsb.length}B${trimmed ? `（${trimmed} 条已裁剪）` : ''}`;
     }
 
     // 时长标记同步过滤：旧帧数与未替换样本撞值、或多条替换共用同一旧帧数时跳过（按值匹配会误伤）
@@ -1214,12 +1321,16 @@ const onExport = async () => {
 };
 
 const onClear = async () => {
-  if (replacedCount.value === 0) {
-    ElMessage.info('还没有替换过任何样本');
+  const trimCount = Object.keys(trimSettings).length;
+  if (replacedCount.value === 0 && trimCount === 0) {
+    ElMessage.info('还没有替换或裁剪过任何样本');
     return;
   }
+  const msg = [];
+  if (replacedCount.value > 0) msg.push(`${replacedCount.value} 条替换`);
+  if (trimCount > 0) msg.push(`${trimCount} 条裁剪`);
   try {
-    await ElMessageBox.confirm('确定要撤销所有替换吗？', '撤销替换', { type: 'warning' });
+    await ElMessageBox.confirm(`确定要撤销所有${msg.join('和')}吗？`, '撤销操作', { type: 'warning' });
   } catch {
     return;
   }
@@ -1232,8 +1343,12 @@ const onClear = async () => {
     }
     delete replaced[i];
   }
+  // 清除所有裁剪设置
+  for (const k of Object.keys(trimSettings)) {
+    delete trimSettings[Number(k)];
+  }
   clearSession();
-  ElMessage.success('已撤销全部替换');
+  ElMessage.success('已撤销全部操作');
 };
 
 onUnmounted(() => {
@@ -1530,6 +1645,9 @@ onUnmounted(() => {
                 <span class="tag">{{ s.channels === 1 ? '单声道' : s.channels + ' 声道' }}</span>
                 <span class="tag">{{ s.frequency }} Hz</span>
                 <span class="tag">{{ formatDuration(s.duration) }}</span>
+                <span v-if="isTrimmed(i)" class="tag trimmed">
+                  已裁剪 {{ trimSettings[i].startSec.toFixed(1) }}s-{{ trimSettings[i].endSec.toFixed(1) }}s
+                </span>
                 <span v-if="isReplaced(i)" class="tag replaced">已替换</span>
                 <span v-if="isReplaced(i) && replacedDuration(i) > 0" class="tag duration-diff" :class="{ longer: replacedDuration(i) > s.duration, shorter: replacedDuration(i) < s.duration }">
                   {{ formatDuration(s.duration) }} → {{ formatDuration(replacedDuration(i)) }}
@@ -1541,6 +1659,9 @@ onUnmounted(() => {
             <div class="row-actions">
               <button class="icon-btn" title="导出该条 WAV" @click="exportSampleWav(i)">
                 <el-icon><Download /></el-icon>
+              </button>
+              <button class="icon-btn" :class="{ trimmed: isTrimmed(i) }" title="裁剪音频" @click="openTrimDialog(i)">
+                <el-icon><Scissor /></el-icon>
               </button>
               <button class="icon-btn" title="样本详情 / 波形 / A·B 对比" @click="openDetail(i)">
                 <el-icon><InfoFilled /></el-icon>
@@ -1760,6 +1881,49 @@ onUnmounted(() => {
           </span>
         </li>
       </ul>
+    </el-dialog>
+
+    <!-- 裁剪对话框 -->
+    <el-dialog v-model="trimDialog" title="裁剪音频" width="min(420px, 92vw)" append-to-body>
+      <div v-if="trimIndex >= 0 && samples[trimIndex]" class="trim-dialog">
+        <div class="trim-info">
+          <span class="trim-name">{{ samples[trimIndex].name }}</span>
+          <span class="trim-duration">原时长：{{ formatDuration(trimOriginalDuration) }}</span>
+        </div>
+        <el-form label-position="top" class="trim-form">
+          <el-form-item label="起始时间（秒）">
+            <el-input-number
+              v-model="trimForm.startSec"
+              :min="0"
+              :max="trimOriginalDuration"
+              :step="0.1"
+              :precision="2"
+              controls-position="right"
+              style="width: 100%"
+            />
+          </el-form-item>
+          <el-form-item label="结束时间（秒）">
+            <el-input-number
+              v-model="trimForm.endSec"
+              :min="0"
+              :max="trimOriginalDuration"
+              :step="0.1"
+              :precision="2"
+              controls-position="right"
+              style="width: 100%"
+            />
+          </el-form-item>
+          <div class="trim-preview">
+            <span>裁剪后时长：</span>
+            <strong>{{ formatDuration(Math.max(0, trimForm.endSec - trimForm.startSec)) }}</strong>
+          </div>
+        </el-form>
+      </div>
+      <template #footer>
+        <el-button @click="trimDialog = false">取消</el-button>
+        <el-button v-if="isTrimmed(trimIndex)" type="danger" @click="clearTrim(trimIndex); trimDialog = false">清除裁剪</el-button>
+        <el-button type="primary" @click="applyTrim">应用</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>
@@ -2985,5 +3149,63 @@ onUnmounted(() => {
   background: rgba(52, 211, 153, 0.14);
   color: #34d399;
   border-color: rgba(52, 211, 153, 0.3);
+}
+
+/* 裁剪相关样式 */
+.tag.trimmed {
+  background: rgba(168, 85, 247, 0.14);
+  color: #a855f7;
+  border-color: rgba(168, 85, 247, 0.3);
+  font-variant-numeric: tabular-nums;
+}
+.icon-btn.trimmed {
+  color: #a855f7;
+  border-color: rgba(168, 85, 247, 0.4);
+  background: rgba(168, 85, 247, 0.1);
+  &:hover {
+    color: #c084fc;
+    border-color: rgba(168, 85, 247, 0.6);
+    background: rgba(168, 85, 247, 0.18);
+  }
+}
+.trim-dialog {
+  .trim-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 16px;
+    padding: 12px;
+    background: var(--panel-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+  }
+  .trim-name {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text);
+  }
+  .trim-duration {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .trim-form {
+    :deep(.el-form-item__label) {
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+  }
+  .trim-preview {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(168, 85, 247, 0.08);
+    border-radius: var(--radius-sm);
+    border: 1px solid rgba(168, 85, 247, 0.2);
+    font-size: 13px;
+    color: var(--text-dim);
+    strong {
+      color: #a855f7;
+      font-variant-numeric: tabular-nums;
+    }
+  }
 }
 </style>
